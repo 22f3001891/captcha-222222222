@@ -1,0 +1,339 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Captcha Solver (Client-side OCR)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Client-side captcha solver using Tesseract.js with smart preprocessing.">
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; padding: 20px; line-height: 1.5; }
+    h1 { font-size: 1.4rem; margin: 0 0 10px; }
+    .wrap { max-width: 900px; margin: 0 auto; }
+    .panel { border: 1px solid #ccc; border-radius: 10px; padding: 16px; margin-bottom: 16px; background: #fafafa; }
+    .row { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-start; }
+    .col { flex: 1 1 280px; }
+    label { font-weight: 600; display: block; margin-bottom: 6px; }
+    input[type="text"] { width: 100%; padding: 10px; font-size: 0.95rem; border-radius: 8px; border: 1px solid #bbb; }
+    button { padding: 10px 14px; border: none; border-radius: 8px; background: #3b82f6; color: white; font-weight: 600; cursor: pointer; }
+    button:disabled { background: #9aa6b2; cursor: not-allowed; }
+    .img-box { display: inline-block; border: 1px dashed #bbb; padding: 8px; border-radius: 8px; background: white; }
+    .meta { font-size: 0.9rem; color: #555; }
+    .status { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.95rem; }
+    .progress { height: 8px; background: #e5e7eb; border-radius: 6px; overflow: hidden; margin-top: 6px; }
+    .progress > div { height: 100%; background: #22c55e; width: 0%; transition: width 0.15s ease; }
+    .code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: #f1f5f9; padding: 2px 6px; border-radius: 6px; }
+    canvas { max-width: 100%; image-rendering: pixelated; }
+    footer { margin-top: 24px; font-size: 0.85rem; color: #666; }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+</head>
+<body>
+<div class="wrap">
+  <h1>Captcha Solver</h1>
+  <div class="panel">
+    <div class="row">
+      <div class="col">
+        <label for="urlInput">Captcha Image URL (?url=...)</label>
+        <input id="urlInput" type="text" placeholder="https://example.com/sample.png">
+        <div class="meta">Current query param: <span id="paramEcho" class="code">N/A</span></div>
+      </div>
+      <div class="col" style="align-self: flex-end;">
+        <button id="solveBtn">Solve</button>
+        <button id="useQueryBtn" title="Load from current ?url=... query">Load from Query</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="row">
+      <div class="col">
+        <label>Captcha Image</label>
+        <div class="img-box">
+          <img id="captchaImg" alt="Captcha" style="max-width: 100%; display:block;" crossorigin="anonymous">
+        </div>
+        <div class="meta">Source (proxied for CORS): <span id="proxiedEcho" class="code">N/A</span></div>
+      </div>
+      <div class="col">
+        <label>Preprocessed (for OCR)</label>
+        <canvas id="procCanvas" width="0" height="0"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <label>Status</label>
+    <div class="status" id="status">Idle</div>
+    <div class="progress" aria-label="OCR Progress"><div id="bar"></div></div>
+    <div class="row" style="margin-top: 10px;">
+      <div class="col">
+        <label>Solved Text</label>
+        <div id="result" class="code" style="font-size: 1.1rem; padding: 8px 10px;">—</div>
+      </div>
+      <div class="col">
+        <label>Timing</label>
+        <div class="meta">Start: <span id="tStart">—</span></div>
+        <div class="meta">End: <span id="tEnd">—</span></div>
+        <div class="meta">Elapsed: <span id="tElapsed">—</span></div>
+      </div>
+    </div>
+  </div>
+
+  <footer>
+    Tip: Provide the captcha image URL via the url query parameter, e.g. ?url=https://example.com/sample.png
+  </footer>
+</div>
+
+<script>
+(function() {
+  const d = document;
+  const qs = new URLSearchParams(location.search);
+  const defaultURL = 'https://example.com/sample.png';
+
+  const els = {
+    urlInput: d.getElementById('urlInput'),
+    solveBtn: d.getElementById('solveBtn'),
+    useQueryBtn: d.getElementById('useQueryBtn'),
+    captchaImg: d.getElementById('captchaImg'),
+    proxiedEcho: d.getElementById('proxiedEcho'),
+    paramEcho: d.getElementById('paramEcho'),
+    procCanvas: d.getElementById('procCanvas'),
+    status: d.getElementById('status'),
+    bar: d.getElementById('bar'),
+    result: d.getElementById('result'),
+    tStart: d.getElementById('tStart'),
+    tEnd: d.getElementById('tEnd'),
+    tElapsed: d.getElementById('tElapsed'),
+  };
+
+  // Read query param and display
+  const rawParamUrl = (qs.get('url') || '').trim();
+  els.paramEcho.textContent = rawParamUrl || '(none)';
+  els.urlInput.value = rawParamUrl || defaultURL;
+
+  // Build a CORS-friendly proxy URL for images (weserv.nl)
+  function buildImageSrc(u) {
+    try {
+      if (!u) return '';
+      if (u.startsWith('data:')) return u; // already usable
+      const parsed = new URL(u);
+      const hostPath = parsed.host + parsed.pathname + (parsed.search || '');
+      return 'https://images.weserv.nl/?output=png&url=' + encodeURIComponent(hostPath);
+    } catch (e) {
+      // Fallback: try as-is (may fail due to CORS)
+      return u;
+    }
+  }
+
+  // Basic utilities for timing display
+  function fmtTime(ts) {
+    if (!ts) return '—';
+    const d = new Date(ts);
+    return d.toLocaleTimeString();
+  }
+  function setTiming(start, end) {
+    els.tStart.textContent = start ? fmtTime(start) : '—';
+    els.tEnd.textContent = end ? fmtTime(end) : '—';
+    els.tElapsed.textContent = (start && end) ? ((end - start) / 1000).toFixed(2) + 's' : '—';
+  }
+
+  function setStatus(msg) {
+    els.status.textContent = msg;
+  }
+  function setProgress(p) {
+    const pc = Math.max(0, Math.min(1, p));
+    els.bar.style.width = (pc * 100).toFixed(1) + '%';
+  }
+
+  // Image preprocessing: upscale, grayscale, Otsu threshold, de-speckle
+  function preprocessImageToCanvas(img) {
+    const srcW = img.naturalWidth || img.width;
+    const srcH = img.naturalHeight || img.height;
+    const maxDimTarget = 700; // aim for decent size for OCR
+    const baseScale = Math.max(2, Math.min(4, Math.ceil(maxDimTarget / Math.max(srcW, srcH))));
+    const scale = baseScale;
+
+    const c = els.procCanvas;
+    const ctx = c.getContext('2d', { willReadFrequently: true });
+    c.width = Math.max(1, Math.floor(srcW * scale));
+    c.height = Math.max(1, Math.floor(srcH * scale));
+
+    // Draw source scaled without smoothing to keep edges crisp
+    ctx.imageSmoothingEnabled = false;
+    ctx.clearRect(0, 0, c.width, c.height);
+    ctx.drawImage(img, 0, 0, c.width, c.height);
+
+    let imgData = ctx.getImageData(0, 0, c.width, c.height);
+    let data = imgData.data;
+
+    // Grayscale and histogram
+    const hist = new Uint32Array(256);
+    for (let i = 0; i < data.length; i += 4) {
+      const r = data[i], g = data[i+1], b = data[i+2];
+      const y = Math.max(0, Math.min(255, Math.round(0.299*r + 0.587*g + 0.114*b)));
+      data[i] = data[i+1] = data[i+2] = y;
+      hist[y]++;
+    }
+
+    // Otsu threshold
+    let total = c.width * c.height;
+    let sum = 0;
+    for (let t = 0; t < 256; t++) sum += t * hist[t];
+
+    let sumB = 0, wB = 0, maxVar = 0, threshold = 127;
+    for (let t = 0; t < 256; t++) {
+      wB += hist[t];
+      if (wB === 0) continue;
+      let wF = total - wB;
+      if (wF === 0) break;
+      sumB += t * hist[t];
+      let mB = sumB / wB;
+      let mF = (sum - sumB) / wF;
+      let betweenVar = wB * wF * (mB - mF) * (mB - mF);
+      if (betweenVar > maxVar) {
+        maxVar = betweenVar;
+        threshold = t;
+      }
+    }
+
+    // Binarize
+    for (let i = 0; i < data.length; i += 4) {
+      const y = data[i];
+      const v = y > threshold ? 255 : 0;
+      data[i] = data[i+1] = data[i+2] = v;
+      data[i+3] = 255;
+    }
+
+    // Simple de-speckle: remove isolated white pixels
+    const w = c.width, h = c.height;
+    const bin = new Uint8Array(w * h);
+    for (let y = 0, idx = 0; y < h; y++) {
+      for (let x = 0; x < w; x++, idx += 4) {
+        bin[(y*w) + x] = data[idx] === 255 ? 1 : 0;
+      }
+    }
+    const out = new Uint8Array(bin.length);
+    for (let y = 1; y < h - 1; y++) {
+      for (let x = 1; x < w - 1; x++) {
+        const idx = y*w + x;
+        if (bin[idx] === 1) {
+          let neighbors = 0;
+          for (let yy = -1; yy <= 1; yy++) {
+            for (let xx = -1; xx <= 1; xx++) {
+              if (xx === 0 && yy === 0) continue;
+              neighbors += bin[idx + yy*w + xx];
+            }
+          }
+          out[idx] = neighbors >= 2 ? 1 : 0; // keep if enough neighbors
+        } else {
+          out[idx] = 0;
+        }
+      }
+    }
+    // Write back to canvas
+    let p = 0;
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++, p++) {
+        const v = out[p] ? 255 : 0;
+        const di = p * 4;
+        data[di] = data[di+1] = data[di+2] = v;
+        data[di+3] = 255;
+      }
+    }
+    ctx.putImageData(imgData, 0, 0);
+    return c;
+  }
+
+  async function recognizeWithTimeout(image, timeoutMs) {
+    let timer;
+    const start = performance.now();
+    setTiming(start, null);
+
+    const promise = Tesseract.recognize(image, 'eng', {
+      logger: m => {
+        if (m && typeof m.progress === 'number') {
+          setProgress(m.progress);
+          setStatus(`OCR: ${Math.round(m.progress * 100)}% - ${m.status || ''}`);
+        }
+      },
+      // Tesseract.js v5 supports psm param; Using single word improves speed/accuracy for captchas
+      psm: 8,
+      tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
+      preserve_interword_spaces: '0',
+      user_defined_dpi: '300',
+    });
+
+    const timeoutP = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('timeout')), timeoutMs);
+    });
+
+    try {
+      const res = await Promise.race([promise, timeoutP]);
+      clearTimeout(timer);
+      const end = performance.now();
+      setTiming(start, end);
+      return res;
+    } catch (e) {
+      clearTimeout(timer);
+      const end = performance.now();
+      setTiming(start, end);
+      throw e;
+    }
+  }
+
+  async function solve(url) {
+    try {
+      els.result.textContent = '—';
+      setProgress(0);
+      setStatus('Loading image...');
+      const proxied = buildImageSrc(url);
+      els.proxiedEcho.textContent = proxied || '(invalid)';
+      els.captchaImg.crossOrigin = 'anonymous';
+      els.captchaImg.src = proxied;
+
+      await new Promise((resolve, reject) => {
+        els.captchaImg.onload = () => resolve();
+        els.captchaImg.onerror = () => reject(new Error('Failed to load image (check URL or CORS).'));
+      });
+
+      setStatus('Preprocessing image...');
+      const processedCanvas = preprocessImageToCanvas(els.captchaImg);
+
+      setStatus('Running OCR...');
+      const { data } = await recognizeWithTimeout(processedCanvas, 15000);
+
+      const text = (data && data.text ? data.text : '').replace(/[^A-Z0-9]/gi, '').toUpperCase();
+      els.result.textContent = text || '(no text detected)';
+      setStatus('Done');
+    } catch (err) {
+      setStatus('Error: ' + err.message);
+      els.result.textContent = '(error)';
+    }
+  }
+
+  // Wire buttons
+  els.useQueryBtn.addEventListener('click', () => {
+    els.urlInput.value = rawParamUrl || defaultURL;
+  });
+  els.solveBtn.addEventListener('click', () => {
+    const val = els.urlInput.value.trim();
+    if (!val) {
+      alert('Please enter a captcha image URL.');
+      return;
+    }
+    solve(val);
+  });
+
+  // Auto-run if query provided
+  if (rawParamUrl) {
+    // Trigger automatically
+    solve(rawParamUrl);
+  } else {
+    // Load default for quick demo
+    els.captchaImg.src = buildImageSrc(defaultURL);
+    els.proxiedEcho.textContent = buildImageSrc(defaultURL);
+  }
+})();
+</script>
+</body>
+</html>
